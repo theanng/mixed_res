@@ -1,0 +1,3 @@
+ultralytics-opencv-headless==8.4.31
+git+https://github.com/matthias-k/DeepGaze.git
+git+https://github.com/facebookresearch/sam2.git

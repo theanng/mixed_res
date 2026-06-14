@@ -1,0 +1,11 @@
+.vscode/
+__pycache__/
+outputs/
+
+*.safetensors
+*.npy
+*.pt
+*.pth
+
+*.mp4
+*.jpg
