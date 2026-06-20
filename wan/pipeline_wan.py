@@ -378,9 +378,7 @@ class WanPipeline(WanPipelineBase):
         stg1_true_steps: int = 0,
         pad1: int = 2,
         pad2: int = 1,
-        plain_mask: bool = False,
-        use_raft: bool = True,
-        use_seg: bool = True,
+        mask_type: str = "w_raft",
     ):
         r"""
         The call function to the pipeline for generation.
@@ -445,8 +443,6 @@ class WanPipeline(WanPipelineBase):
                 Number of initial low-resolution denoising steps before constructing the mixed-resolution branch. The
                 mixed-resolution path requires at least one LR step to estimate `x0`, so values below `1` are treated
                 as `1`.
-            plain_mask (`bool`, defaults to `False`):
-                Keep the initial saliency-based mask without applying segmentation or RAFT refinement.
 
         Returns:
             [`~WanPipelineOutput`] or `tuple`
@@ -499,9 +495,11 @@ class WanPipeline(WanPipelineBase):
         if self.config.boundary_ratio is not None and guidance_scale_2 is None:
             guidance_scale_2 = guidance_scale
 
-        if plain_mask:
-            use_seg = False
-            use_raft = False
+        use_seg, use_raft = False, False # mask_type == "base"
+        if mask_type == "w_raft":
+            use_raft = True
+        elif mask_type == "w_seg":
+            use_seg = True
 
         self._guidance_scale = guidance_scale
         self._guidance_scale_2 = guidance_scale_2

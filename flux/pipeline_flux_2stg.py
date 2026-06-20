@@ -186,8 +186,7 @@ class FluxPipeline(FluxPipeline_BASE):
         stg1_true_steps: int = 6,
         stg2_true_steps: int = 9,
         use_dct_mid_up_split: bool = True,
-        plain_mask: bool = False,
-        use_seg: bool = True,
+        mask_type: str = "w_seg",
         feather_radius: int = 28,
     ):
         if num_images_per_prompt != 1:
@@ -220,8 +219,9 @@ class FluxPipeline(FluxPipeline_BASE):
         num_inference_steps = stg1_true_steps + stg2_true_steps
         self._num_timesteps = num_inference_steps
 
-        if plain_mask:
-            use_seg = False
+        use_seg = False # mask_type == "base"
+        if mask_type == "w_seg":
+            use_seg = True
 
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
@@ -418,6 +418,7 @@ class FluxPipeline(FluxPipeline_BASE):
                     print("use seg mask")
             
             print(f"mask ratio: {core_hr_mask_LR.float().mean():.2f}")
+            self._last_hr_mask_LR = core_hr_mask_LR.detach().clone()  # [b,1,ht,wt] bool, for diagnosis
 
             actual_lr_mask_bchw = ~core_hr_mask_LR
             if pad1 > 0:

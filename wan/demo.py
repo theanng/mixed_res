@@ -36,7 +36,7 @@ def parse_args():
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--stg1_steps", type=int, default=15)
     parser.add_argument("--shift", type=float, default=3.0)
-    parser.add_argument("--plain", dest="plain_mask", action="store_true")
+    parser.add_argument("--mask_type", type=str, choices=["base", "w_raft", "w_seg"], default="w_raft")
 
     parser.add_argument("--ckpt_dir", type=str, default="./ckpts")
     parser.add_argument("--prompt", type=str, default="A train going down the tracks that has just gone under a bridge.")
@@ -76,12 +76,12 @@ def main(args):
     pipe.centerbias_tensor = torch.from_numpy(centerbias).unsqueeze(0).to(args.device)  # [1, h, w]
     pipe.gaze_model = deepgaze_pytorch.DeepGazeIIE(pretrained=True).to(args.device)
 
-    if not args.plain_mask:
+    if args.mask_type == "w_seg":
         pipe.seg_model = YOLOE(os.path.join(args.ckpt_dir, "yoloe-26s-seg-pf.pt")).to(args.device)
         pipe.sam2_predictor = prepare_sam2_tiny_video_predictor(args.ckpt_dir, device=args.device)
         pipe.warmup_seg(args.num_frames, args.height, args.width, args.device, torch_dtype)
 
-        pipe.raft = raft_small(weights=Raft_Small_Weights.DEFAULT).to(args.device)
+    pipe.raft = raft_small(weights=Raft_Small_Weights.DEFAULT).to(args.device)
 
     pipe.tvae = TAEHV(os.path.join(args.ckpt_dir, "taew2_1.pth")).to(torch_dtype).to(args.device)
 
@@ -112,8 +112,7 @@ def main(args):
     )
 
     pipe.gaze_model.eval()
-    if not args.plain_mask:
-        pipe.raft.eval()
+    pipe.raft.eval()
     pipe.tvae.eval()
 
     #-----------------inference----------------
@@ -129,7 +128,7 @@ def main(args):
         generator=torch.Generator().manual_seed(args.seed),
         hr_ratio=args.hr_ratio,
         stg1_true_steps=args.stg1_steps,
-        plain_mask=args.plain_mask,
+        mask_type=args.mask_type,
     ).frames[0]
     export_to_video(output, args.output, fps=args.fps)
 

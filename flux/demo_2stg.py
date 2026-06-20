@@ -31,11 +31,11 @@ def parse_args():
     parser.add_argument("--lr_shift", type=float, default=1.8776105792643432) # same as original FLUX
     parser.add_argument("--hr_shift", type=float, default=3.0)
     parser.add_argument("--hr_ratio", type=float, default=0.6)
-    parser.add_argument("--plain", dest="plain_mask", action="store_true")
+    parser.add_argument("--mask_type", type=str, choices=["base", "w_seg"], default="w_seg")
 
     parser.add_argument("--ckpt_dir", type=str, default="./ckpts")
     parser.add_argument("--prompt", type=str, default="a black cat")
-    parser.add_argument("--output", type=str, default="output.jpg")
+    parser.add_argument("--output", type=str, default="output_2stg.jpg")
 
     return parser.parse_args()
 
@@ -71,7 +71,7 @@ def main(args):
     pipe.gaze_model = deepgaze_pytorch.DeepGazeI(pretrained=True).to(args.device)
     pipe.gaze_model.eval()
 
-    if not args.plain_mask:
+    if args.mask_type == "w_seg":
         pipe.seg_model = YOLOE(os.path.join(args.ckpt_dir, "yoloe-26s-seg-pf.pt")).to(args.device)
 
     pipe.lt_upscaler = instantiate_resizer(
@@ -106,7 +106,7 @@ def main(args):
         hr_ratio=args.hr_ratio,
         stg1_true_steps=args.stg1_steps,
         stg2_true_steps=args.stg2_steps,
-        plain_mask=args.plain_mask,
+        mask_type=args.mask_type,
     ).images[0]
     image.save(args.output)
 
