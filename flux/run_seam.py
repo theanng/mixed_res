@@ -55,7 +55,10 @@ def build_pipe(args, dtype=torch.bfloat16):
     cb -= logsumexp(cb)
     pipe.centerbias_tensor = torch.from_numpy(cb).unsqueeze(0).to(args.device)
     pipe.gaze_shape = gaze_shape
-    pipe.gaze_model = deepgaze_pytorch.DeepGazeI(pretrained=True).to(args.device).eval()
+    # NOTE: assign then .eval() on a SEPARATE line — DeepGaze's .eval() returns None, so
+    # chaining `.to(device).eval()` would store None (matches the author's demo_2stg.py).
+    pipe.gaze_model = deepgaze_pytorch.DeepGazeI(pretrained=True).to(args.device)
+    pipe.gaze_model.eval()
     if args.mask_type == "w_seg":
         pipe.seg_model = YOLOE(os.path.join(args.ckpt_dir, "yoloe-26s-seg-pf.pt")).to(args.device)
 
@@ -91,9 +94,15 @@ def run_one(pipe, args, prompt, pad):
 
 def main(args):
     pipe = build_pipe(args)
-    settings = {"er": args.pad, "noer": 0}
+    # variant flags on the transformer (default off => released behavior unchanged)
+    pipe.transformer.footprint_sinc = args.sinc
+    pipe.transformer.footprint_sinc_strength = args.sinc_strength
+    if args.group:
+        pipe.transformer.config.lr_rope_downsample_hr_tokens = True
+    pre = args.tag_prefix
+    settings = {pre + "er": args.pad, pre + "noer": 0}
     if args.only:
-        settings = {args.only: settings[args.only]}
+        settings = {pre + args.only: settings[pre + args.only]}
     for category, prompt in flat():
         idx = main.counter.setdefault(category, 0)
         for tag, pad in settings.items():
@@ -123,6 +132,10 @@ if __name__ == "__main__":
     ap.add_argument("--mask_type", choices=["base", "w_seg"], default="w_seg")
     ap.add_argument("--pad", type=int, default=2, help="E&R band size (the 'er' setting)")
     ap.add_argument("--only", choices=["er", "noer"], default=None)
+    ap.add_argument("--sinc", action="store_true", help="footprint sinc envelope on LR tokens")
+    ap.add_argument("--sinc_strength", type=float, default=1.0, help=">1 = sharper band-limit")
+    ap.add_argument("--group", action="store_true", help="2x2 HR-key grouping for LR queries")
+    ap.add_argument("--tag_prefix", default="", help='output subfolder prefix, e.g. "sinc_" -> sinc_er/sinc_noer')
     ap.add_argument("--ckpt_dir", default="./ckpts")
     ap.add_argument("--out_dir", default="./seam_out")
     main(ap.parse_args())

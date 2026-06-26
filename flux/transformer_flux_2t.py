@@ -125,6 +125,29 @@ class FluxTransformer2DModel(FluxTransformer2DModel_BASE):
 
         hidden_states = mixed_tokens
 
+        # Footprint sinc envelope (flag-gated). CRPA fixes phase/centroid but treats every token
+        # as a point; an LR token actually averages a 2x2 footprint, so its positional signature
+        # should be band-limited to sinc(w*omega/2) with w=2. We build that envelope over the RoPE
+        # dim layout (axes T=16,H=56,W=56, each freq repeat_interleaved by 2; T = no spatial
+        # footprint -> 1) and pass it to the attention, which applies it to the LR-token rows only
+        # (HR tokens are the w=1 reference, left untouched).
+        env_lr_footprint = None
+        if getattr(self, "footprint_sinc", False):
+            strength = float(getattr(self, "footprint_sinc_strength", 1.0))
+            pe = self.pos_embed
+            dev = hidden_states_lr.device
+
+            def _win(freqs, w=2.0):
+                a = freqs.to(torch.float32) * (w * strength / 2.0)
+                s = torch.where(a.abs() < 1e-6, torch.ones_like(a), torch.sin(a) / a)
+                return s.clamp(0.0, 1.0).repeat_interleave(2)
+
+            env_lr_footprint = torch.cat([
+                torch.ones(pe.base_freqs_t.numel() * 2, dtype=torch.float32, device=dev),
+                _win(pe.base_freqs_h).to(dev),
+                _win(pe.base_freqs_w).to(dev),
+            ]).to(hidden_states_lr.dtype)
+
         if n_lr == N or not self.seperate_attention:
             token_info = None
             if self.base_use_rope_lr:
@@ -148,6 +171,7 @@ class FluxTransformer2DModel(FluxTransformer2DModel_BASE):
                 "has_overlap_lr": has_overlap_lr,
                 "has_overlap_hr": has_overlap_hr,
                 "lr_rope_downsample_hr_tokens": getattr(self.config, "lr_rope_downsample_hr_tokens", False),
+                "footprint_env_lr": env_lr_footprint,
             }
             image_rotary_emb = None
 

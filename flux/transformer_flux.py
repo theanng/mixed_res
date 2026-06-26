@@ -123,6 +123,17 @@ def _filter_by_idx(
     idx_expand = idx.view(B, K, *([1] * (tensor.dim() - 2))).expand(-1, -1, *tensor.shape[2:])
     return torch.gather(tensor, dim=1, index=idx_expand)
 
+
+def _band_limit_renorm(x: torch.Tensor, env: torch.Tensor) -> torch.Tensor:
+    """Apply the footprint sinc envelope to a roped q/k tensor, then restore its original
+    per-token per-head L2 norm. Renormalizing keeps the attention-logit scale (softmax
+    temperature) unchanged -- only the per-frequency DIRECTION shifts toward low frequencies,
+    so the band-limit survives without the magnitude collapse that scaling alone caused."""
+    n0 = x.norm(dim=-1, keepdim=True)
+    x = x * env
+    return x * (n0 / (x.norm(dim=-1, keepdim=True) + 1e-6))
+
+
 class FluxAttnProcessor:
     _attention_backend = None
 
@@ -169,6 +180,7 @@ class FluxAttnProcessor:
             has_overlap_lr = mixed_res_info.get("has_overlap_lr", False)
             has_overlap_hr = mixed_res_info.get("has_overlap_hr", False)
             lr_rope_downsample_hr_tokens = mixed_res_info.get("lr_rope_downsample_hr_tokens", False)
+            env_lr_footprint = mixed_res_info.get("footprint_env_lr", None)  # [head_dim] sinc envelope or None
 
             n_txt = rotary_emb_txt[0].shape[0] # 512
 
@@ -253,6 +265,14 @@ class FluxAttnProcessor:
                 query_lr = apply_rotary_emb(query_lr, (cos_lr.squeeze(0), sin_lr.squeeze(0)))
                 key_context = apply_rotary_emb(key_context, (cos_context.squeeze(0), sin_context.squeeze(0)))
 
+                if env_lr_footprint is not None:
+                    # band-limit the LR tokens (footprint w=2): the LR query, and the LR key rows
+                    # (first n_lr of key_context). HR keys after them stay w=1 (untouched).
+                    e = env_lr_footprint.view(1, 1, 1, -1).to(query_lr.dtype)
+                    query_lr = _band_limit_renorm(query_lr, e)
+                    key_context = torch.cat(
+                        [_band_limit_renorm(key_context[:, :n_lr], e), key_context[:, n_lr:]], dim=1)
+
                 # add text key, value
                 key_context = torch.cat([encoder_key, key_context], dim=1)
                 value_context = torch.cat([encoder_value, value_context], dim=1)
@@ -311,6 +331,15 @@ class FluxAttnProcessor:
 
                 query_hr = apply_rotary_emb(query_hr, (cos_hr_tokens.squeeze(0), sin_hr_tokens.squeeze(0)))
                 key_hr_context = apply_rotary_emb(key_hr_context, (cos_hr_context.squeeze(0), sin_hr_context.squeeze(0)))
+
+                if env_lr_footprint is not None and n_lr > 0:
+                    # HR query is w=1 (untouched); the LR keys are the TAIL of key_hr_context
+                    # (after the n_hr HR-token keys) -> band-limit only those.
+                    n_hr_count = query_hr.shape[1]
+                    e = env_lr_footprint.view(1, 1, 1, -1).to(key_hr_context.dtype)
+                    key_hr_context = torch.cat(
+                        [key_hr_context[:, :n_hr_count],
+                         _band_limit_renorm(key_hr_context[:, n_hr_count:], e)], dim=1)
 
                 # add text key, value
                 key_hr_context = torch.cat([encoder_key, key_hr_context], dim=1)
