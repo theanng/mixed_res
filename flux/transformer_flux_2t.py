@@ -125,28 +125,20 @@ class FluxTransformer2DModel(FluxTransformer2DModel_BASE):
 
         hidden_states = mixed_tokens
 
-        # Footprint sinc envelope (flag-gated). CRPA fixes phase/centroid but treats every token
-        # as a point; an LR token actually averages a 2x2 footprint, so its positional signature
-        # should be band-limited to sinc(w*omega/2) with w=2. We build that envelope over the RoPE
-        # dim layout (axes T=16,H=56,W=56, each freq repeat_interleaved by 2; T = no spatial
-        # footprint -> 1) and pass it to the attention, which applies it to the LR-token rows only
-        # (HR tokens are the w=1 reference, left untouched).
-        env_lr_footprint = None
-        if getattr(self, "footprint_sinc", False):
-            strength = float(getattr(self, "footprint_sinc_strength", 1.0))
-            pe = self.pos_embed
+        # HR->LR footprint expansion (Variant A, flag-gated). The down-path grouping already lets
+        # LR queries read HR keys at LR scale; this completes the symmetry so HR queries read each
+        # LR key spread over its 2x2 HR-grid footprint (content copied, positions = anchor + unit
+        # step). Summing the 4 phase-shifted copies reproduces the footprint sinc envelope in a
+        # softmax-safe way. We only need the 4 unit-step rotaries -- get_rotary_for_coords at the
+        # footprint offsets (dy,dx) gives exactly those, consistent with how HR tokens are placed.
+        lr_expand_steps = None
+        if getattr(self, "hr_lr_expand", False):
             dev = hidden_states_lr.device
-
-            def _win(freqs, w=2.0):
-                a = freqs.to(torch.float32) * (w * strength / 2.0)
-                s = torch.where(a.abs() < 1e-6, torch.ones_like(a), torch.sin(a) / a)
-                return s.clamp(0.0, 1.0).repeat_interleave(2)
-
-            env_lr_footprint = torch.cat([
-                torch.ones(pe.base_freqs_t.numel() * 2, dtype=torch.float32, device=dev),
-                _win(pe.base_freqs_h).to(dev),
-                _win(pe.base_freqs_w).to(dev),
-            ]).to(hidden_states_lr.dtype)
+            dy = torch.tensor([0.0, 0.0, 1.0, 1.0], device=dev)
+            dx = torch.tensor([0.0, 1.0, 0.0, 1.0], device=dev)
+            t0 = torch.zeros(4, device=dev)
+            cos_steps, sin_steps = self.pos_embed2.get_rotary_for_coords(t0, dy, dx)  # [4, head_dim]
+            lr_expand_steps = (cos_steps, sin_steps)
 
         if n_lr == N or not self.seperate_attention:
             token_info = None
@@ -171,7 +163,16 @@ class FluxTransformer2DModel(FluxTransformer2DModel_BASE):
                 "has_overlap_lr": has_overlap_lr,
                 "has_overlap_hr": has_overlap_hr,
                 "lr_rope_downsample_hr_tokens": getattr(self.config, "lr_rope_downsample_hr_tokens", False),
-                "footprint_env_lr": env_lr_footprint,
+                "lr_group_mode": getattr(self, "lr_group_mode", "mean"),
+                "attn_capture": getattr(self, "attn_capture", False),
+                "coords_hr": mask_state.get("coords_hr"),
+                "s2_step": getattr(self, "_s2_step", -1),
+                "s2_nsteps": getattr(self, "_s2_nsteps", 0),
+                "lr_expand": lr_expand_steps is not None,
+                "lr_expand_steps": lr_expand_steps,
+                "lr_expand_masscal": bool(getattr(self, "hr_lr_expand_masscal", False)),
+                "area_scale": getattr(self, "attn_area_scale", "off"),   # area-weighted softmax: off|hr|lr|both
+                "native_ctx": getattr(self, "native_ctx", "off"),        # single-resolution canvases: off|near|full
             }
             image_rotary_emb = None
 

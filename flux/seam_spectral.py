@@ -258,7 +258,7 @@ def phase_jump(img, mask, lr_factor=2, offset=40, patch=64, max_pairs=40, seed=0
 def scale_shift(img, mask, lr_factor=2, fmin=0.04, offset=40, patch=64, max_pairs=60):
     """Dominant-SCALE shift across the seam — the readout SSS is blind to.
 
-    SSS measures the octave-tail energy DEFICIT (resolution seam). The grouping/sinc envelope
+    SSS measures the octave-tail energy DEFICIT (resolution seam). The grouping down-path
     instead fixes the same element rendered at two SIZES (big/small stone, mismatched brick
     courses) — a shift in the spectral CENTROID, not the tail, so SSS stays flat while it moves.
 
@@ -304,9 +304,9 @@ def analyze(img, mask, lr_factor=2):
 
 # ----------------------------------------------- aggregate over seam_out/{er,noer}
 def diagnose_folder(root="seam_out", tags=("er", "noer"), lr_factor=2):
-    """Aggregate by category across arbitrary tag folders (e.g. er / noer / group_er / sinc_er).
+    """Aggregate by category across arbitrary tag folders (e.g. er / noer / group_er / prenorm_er).
     Prints one block per metric: SSS (resolution seam), lowEx (content seam), scale (the
-    scale-jump grouping/sinc target). Expects root/<tag>/<category>_<i>/{mixed.png,mask.npy,meta.json}."""
+    scale-jump grouping target). Expects root/<tag>/<category>_<i>/{mixed.png,mask.npy,meta.json}."""
     import glob, json, os
     from collections import defaultdict
     from PIL import Image
