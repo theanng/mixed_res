@@ -83,19 +83,23 @@ class FluxPipeline(FluxPipeline_BASE):
 
         lt = self._unpack_latents(latents_x0, self._h*ori_scale, self._w*ori_scale, self.vae_scale_factor)
         if resize_scale == 2.0:
-            assert mode in ["", "repeat", "bi"]
-            if mode == "": 
+            assert mode in ["", "repeat", "bi", "bilinear"]
+            if mode == "":
                 new_lt = self.lt_upscaler(lt)
-            elif mode == "bi": 
+            elif mode == "bi":
                 new_lt = self.bi_upscaler(lt)
-            elif mode == "repeat": 
+            elif mode == "repeat":
                 new_lt = lt.repeat_interleave(2, dim=-2).repeat_interleave(2, dim=-1)
+            elif mode == "bilinear":    # training-free
+                new_lt = F.interpolate(lt.float(), scale_factor=2, mode="bilinear", align_corners=False).to(lt.dtype)
         elif resize_scale == 0.5:
-            assert mode in ["", "repeat"]
+            assert mode in ["", "repeat", "avgpool"]
             if mode == "":
                 new_lt = self.lt_downscaler(lt)
             elif mode == "repeat":
                 new_lt = lt[..., ::2, ::2]
+            elif mode == "avgpool":     # training-free
+                new_lt = F.avg_pool2d(lt.float(), 2).to(lt.dtype)
         if align_mean:
             new_lt, _ = align_latent_mean_shift_flexible(lt, new_lt)
         latents_new_x0 = self._pack_lt_w_scale(new_lt, new_scale) 
@@ -131,12 +135,13 @@ class FluxPipeline(FluxPipeline_BASE):
         return latents_fake
 
     @torch.no_grad()
-    def _lowpass_packed(self, x, hw_scale, pad=16):
+    def _lowpass_packed(self, x, hw_scale, pad=16, cut_scale=1.0):
         """Keep only what an LR grid can represent: ideal low-pass at the LR Nyquist (0.25 cyc/px of the
         HR latent), reflect-padded. Near-idempotent, so one refresh locks the layout (error ~0.2 vs ~1.1
-        for pool+bilinear) while leaving the band's own high frequencies almost untouched."""
+        for pool+bilinear) while leaving the band's own high frequencies almost untouched.
+        cut_scale < 1 keeps only coarser structure (e.g. 0.5 = half the LR Nyquist)."""
         lt = self._unpack_latents(x, self._h * hw_scale, self._w * hw_scale, self.vae_scale_factor).float()
-        cut = 0.5 / hw_scale
+        cut = 0.5 / hw_scale * cut_scale
         p = F.pad(lt, (pad,) * 4, mode="reflect"); Hh, Ww = p.shape[-2:]
         fy = torch.fft.fftfreq(Hh, device=p.device).abs()[:, None]
         fx = torch.fft.rfftfreq(Ww, device=p.device)[None, :]
@@ -166,6 +171,75 @@ class FluxPipeline(FluxPipeline_BASE):
         lt_down, _ = self._resize_x0_to_x0(hr_x0_clean.to(hr_x0.dtype), 1.0 / hr_scale, "", ori_scale=hr_scale)
         lr = self._synthesize_latents_from_x0(lt_down, lr_new, lr_noise, bd1_mask, next_t_lr)
         return hr, lr
+
+    @torch.no_grad()
+    def _relay_step(self, latents_lr, latents_hr, lr_x0_prev, t_lr, t_hr, timestep_lr, timestep_hr,
+                    next_t_hr, sched_lr, sched_hr, lr_noise, core_seq_lr, core_seq_hr, hr_idx,
+                    guidance, pooled, prompt_embeds, text_ids, ids_lr, ids_hr, hr_scale):
+        """One stage-2 step of the RELAY (native_ctx="relay"): two separate native streams, no
+        cross-resolution attention anywhere, run in sequence so nothing lags.
+
+          1. HR stream: the HR region's tokens + text only (HR<->HR, HR<->text) -> HR x0.
+          2. Fake LR = down(HR x0) of the region, from THIS step's estimate, noised to the LR level.
+          3. LR stream: complete native LR canvas (real LR + fake LR) + text -> LR x0. The fake LR reads
+             the real LR around it at its own resolution.
+          4. Relay: the fake LR's change, up(LR x0 after) - up(fake LR before), low-passed to what an LR
+             grid can represent and restricted to the region, is added to the HR latent. HR keeps its own
+             high frequencies; only the low-frequency disagreement with its surroundings moves.
+        Using the difference of two up() calls cancels the resampler's bias (learned or bilinear)."""
+        dt = latents_lr.dtype
+        learned = getattr(self, "relay_resampler", "learned") == "learned"
+        up_m, down_m = ("bi", "") if learned else ("bilinear", "avgpool")
+        gain = float(getattr(self, "relay_gain", 1.0))
+        cut = float(getattr(self, "relay_cut", 1.0))
+
+        # 1) HR stream (optional text-logit bias: a small window otherwise over-weights the 512 text keys)
+        kw = dict(self.joint_attention_kwargs or {})
+        tb = getattr(self, "relay_text_bias", 0.0)
+        n_txt, n_hr = prompt_embeds.shape[1], hr_idx.numel()
+        if tb == "auto":
+            tb = float(np.log(n_hr / float(latents_hr.shape[1])))      # visible / full-image HR tokens
+        tb = float(tb)
+        if tb != 0.0:
+            m = torch.zeros(1, 1, 1, n_txt + n_hr, device=latents_hr.device, dtype=dt)
+            m[..., :n_txt] = tb
+            kw["attention_mask"] = m
+        ids_hr2 = ids_hr[0] if ids_hr.ndim == 3 else ids_hr
+        with self.transformer.cache_context("cond"):
+            v_hr = self.transformer(
+                hidden_states=latents_hr[:, hr_idx], timestep=timestep_hr / 1000, guidance=guidance,
+                pooled_projections=pooled, encoder_hidden_states=prompt_embeds, txt_ids=text_ids,
+                img_ids=ids_hr2[hr_idx], joint_attention_kwargs=kw, return_dict=False)[0]
+        pred_hr = torch.zeros_like(latents_hr)
+        pred_hr[:, hr_idx] = v_hr.to(pred_hr.dtype)
+        hr_new, hr_x0 = sched_hr.step(pred_hr, t_hr, latents_hr, return_dict=False)
+
+        # 2) fake LR from this step's HR estimate (clean composite so never-processed tokens can't leak)
+        lr_prev_up, _ = self._resize_x0_to_x0(lr_x0_prev, hr_scale, up_m, ori_scale=1)
+        hr_comp = (hr_x0.float() * core_seq_hr + lr_prev_up.float() * (1 - core_seq_hr)).to(dt)
+        fake_x0, _ = self._resize_x0_to_x0(hr_comp, 1.0 / hr_scale, down_m, ori_scale=hr_scale)
+        fake_in = self._add_noise_at_t(fake_x0, lr_noise, t_lr)
+        lr_in = (latents_lr.float() * (1 - core_seq_lr) + fake_in.float() * core_seq_lr).to(dt)
+
+        # 3) LR stream: complete native LR canvas
+        with self.transformer.cache_context("cond"):
+            v_lr = self.transformer(
+                hidden_states=lr_in, timestep=timestep_lr / 1000, guidance=guidance,
+                pooled_projections=pooled, encoder_hidden_states=prompt_embeds, txt_ids=text_ids,
+                img_ids=ids_lr, joint_attention_kwargs=self.joint_attention_kwargs, return_dict=False)[0]
+        lr_new, lr_x0 = sched_lr.step(v_lr, t_lr, lr_in, return_dict=False)
+
+        # 4) relay the fake LR's change down to the HR region (low frequencies only)
+        if gain != 0.0:
+            before = (lr_x0.float() * (1 - core_seq_lr) + fake_x0.float() * core_seq_lr).to(dt)
+            up_after, _ = self._resize_x0_to_x0(lr_x0, hr_scale, up_m, ori_scale=1)
+            up_before, _ = self._resize_x0_to_x0(before, hr_scale, up_m, ori_scale=1)
+            corr = self._lowpass_packed((up_after.float() - up_before.float()).to(dt), hr_scale,
+                                        cut_scale=cut).float() * core_seq_hr * gain
+            sig = next_t_hr.reshape(1).float()[0] * 1e-3 if next_t_hr is not None else 0.0
+            hr_new = (hr_new.float() + (1.0 - sig) * corr).to(hr_new.dtype)
+            hr_x0 = (hr_x0.float() + corr).to(hr_x0.dtype)
+        return lr_new, hr_new, lr_x0, hr_x0
 
     @torch.no_grad()
     def _trace_dump(self, j, latents_hr_x0, latents_lr_x0, actual_hr_mask, core_hr_mask_LR,
@@ -646,7 +720,9 @@ class FluxPipeline(FluxPipeline_BASE):
             # core + a band of proxy HR = up(LR x0). Proxies are rebuilt every step by the E&R resizers and
             # never kept as output, so this reuses the E&R refresh path (forced on, band = native_band).
             _nc = getattr(self, "native_ctx", "off")
-            if _nc != "off":
+            if _nc == "relay":
+                pad1, pad2 = 1, 0      # LR canvas complete (fake LR in the region); HR stream = the region only
+            elif _nc != "off":
                 pad1 = max(int(pad1), 1)
                 pad2 = max(int(getattr(self, "native_band", 2)), 1)
 
@@ -763,6 +839,29 @@ class FluxPipeline(FluxPipeline_BASE):
                 timestep_hr = t_hr.expand(bsz).to(stage2_lr_noise.dtype)
                 next_t_lr = timesteps_stg2_lr[j + 1] if (j + 1) < len(timesteps_stg2_lr) else None
                 next_t_hr = timesteps_stg2_hr[j + 1] if (j + 1) < len(timesteps_stg2_hr) else None
+
+                if _nc == "relay":
+                    # two separate native streams + low-frequency relay (see _relay_step)
+                    if j == 0:
+                        relay_seq_lr = rearrange(transform_base_mask(core_hr_mask_LR, 1, patch_size=1).float(),
+                                                 "b c h w -> b (h w) c").to(latents_lr.device)
+                        relay_seq_hr = actual_hr_mask.float()
+                        relay_idx = actual_hr_mask[0, :, 0].nonzero().squeeze(1)
+                        print(f"[relay] HR stream = {relay_idx.numel()} tokens "
+                              f"({relay_idx.numel() / actual_hr_mask.shape[1]:.2f} of the image), "
+                              f"resampler={getattr(self, 'relay_resampler', 'learned')} "
+                              f"gain={getattr(self, 'relay_gain', 1.0)} cut={getattr(self, 'relay_cut', 1.0)} "
+                              f"text_bias={getattr(self, 'relay_text_bias', 0.0)}")
+                    latents_lr, latents_hr, latents_lr_x0, latents_hr_x0 = self._relay_step(
+                        latents_lr, latents_hr, latents_lr_x0, t_lr, t_hr, timestep_lr, timestep_hr,
+                        next_t_hr, scheduler_stg2_lr, scheduler_stg2_hr, stage2_lr_noise,
+                        relay_seq_lr, relay_seq_hr, relay_idx, guidance, pooled_prompt_embeds,
+                        prompt_embeds, text_ids, latent_lr_image_ids, latent_hr_image_ids, hr_scale)
+                    if getattr(self, "_trace_steps", False):
+                        self._trace_dump(j, latents_hr_x0, latents_lr_x0, actual_hr_mask,
+                                         core_hr_mask_LR, feather_radius, hr_scale)
+                    progress_bar.update()
+                    continue
 
                 with self.transformer.cache_context("cond"):
                     noise_pred_lr, noise_pred_hr = self.transformer.forward_mixed(

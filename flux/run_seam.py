@@ -105,6 +105,10 @@ def main(args):
     pipe.transformer.attn_area_scale = args.area_scale          # area-weighted softmax (+log(area) on keys)
     pipe.native_ctx = pipe.transformer.native_ctx = args.native_ctx   # single-resolution canvases (proxy context)
     pipe.native_band = args.native_band                         # HR proxy band width (LR cells)
+    pipe.relay_resampler = args.relay_resampler                 # relay: learned | bilinear
+    pipe.relay_gain = args.relay_gain
+    pipe.relay_cut = args.relay_cut
+    pipe.relay_text_bias = args.relay_text_bias if args.relay_text_bias == "auto" else float(args.relay_text_bias)
     pipe.native_band_mode = args.native_band_mode               # lf = band keeps own detail; replace = plain E&R
     pipe.invert_hr_init = args.invert_hr        # structure-locked HR init (flow-inversion vs random)
     pipe.invert_hr_steps = args.invert_steps
@@ -173,9 +177,17 @@ if __name__ == "__main__":
     ap.add_argument("--area_scale", nargs="?", const="both", default="off", choices=["off", "hr", "lr", "both"],
                     help="area-weighted softmax (+log(area) on key logits). bare flag = both; "
                          "hr = HR-query branch only (LR-anchor +log4); lr = LR-query branch only")
-    ap.add_argument("--native_ctx", choices=["off", "near", "full"], default="off",
+    ap.add_argument("--native_ctx", choices=["off", "near", "full", "relay"], default="off",
                     help="single-resolution canvases with E&R-resizer proxies (forces the proxy refresh on, "
                          "overrides --pad). near = far field still via CRPA; full = no cross-resolution keys")
+    ap.add_argument("--relay_resampler", choices=["learned", "bilinear"], default="learned",
+                    help="relay: learned = E&R resizers (bi_up / lt_down); bilinear = training-free bilinear up + avg-pool down")
+    ap.add_argument("--relay_gain", type=float, default=1.0,
+                    help="relay: strength of the fake-LR correction passed to HR (0 = two streams, no relay)")
+    ap.add_argument("--relay_cut", type=float, default=1.0,
+                    help="relay: low-pass cutoff as a fraction of the LR Nyquist (1 = all an LR grid can hold)")
+    ap.add_argument("--relay_text_bias", default="0",
+                    help="relay: logit bias on text keys in the HR stream; 'auto' = log(HR tokens / full-image tokens)")
     ap.add_argument("--native_band", type=int, default=2, help="HR proxy band around the core, in LR cells")
     ap.add_argument("--native_band_mode", choices=["lf", "replace"], default="lf",
                     help="lf = band keeps its own high frequencies, only low frequencies locked to LR; "
