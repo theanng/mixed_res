@@ -13,7 +13,10 @@
 # limitations under the License.
 
 from __future__ import annotations
+import contextlib
+import functools
 import inspect
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import copy
 
@@ -34,9 +37,28 @@ from .pipeline_flux_base import (
 from .utils.dct_func import patch_dct_energy_mask
 from .utils.seg_func import refine_mask_w_seg
 from .utils.helpers import transform_base_mask, feather_mask_from_bool, quick_benchmark_gpu, align_latent_mean_shift_flexible
+from .xscale import build_xscale
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+@contextlib.contextmanager
+def _scr_timed(on, out, key):
+    """Wall time of a block in ms, accumulated into out[key] (SCR diagnostics, --scr_log)."""
+    if not on:
+        yield
+        return
+    sync = torch.cuda.is_available()
+    if sync:
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        if sync:
+            torch.cuda.synchronize()
+        out[key] = out.get(key, 0.0) + (time.perf_counter() - t0) * 1e3
 
 
 def _patch_cos_dist(a, b, pm):
@@ -149,6 +171,82 @@ class FluxPipeline(FluxPipeline_BASE):
         return self._pack_lt_w_scale(lp[..., pad:-pad, pad:-pad].to(x.dtype), hw_scale)
 
     @torch.no_grad()
+    def _gauss_packed(self, x, hw_scale, sigma=0.75, radius=3):
+        """SCR band filter 'gauss' (spec §2.5): separable Gaussian on the unpacked latent, sigma 0.75
+        latent px (gain 0.5 at 0.25 cyc/px = the LR Nyquist), reflect padding. Compact support, so a
+        region-masked correction does not ring the way the brick-wall _lowpass_packed does (W3)."""
+        lt = self._unpack_latents(x, self._h * hw_scale, self._w * hw_scale, self.vae_scale_factor).float()
+        d = torch.arange(-radius, radius + 1, device=lt.device, dtype=torch.float32)
+        w = torch.exp(-d ** 2 / (2.0 * sigma ** 2))
+        w = w / w.sum()
+        c = lt.shape[1]
+        lt = F.conv2d(F.pad(lt, (radius, radius, 0, 0), mode="reflect"),
+                      w.view(1, 1, 1, -1).expand(c, 1, 1, -1).contiguous(), groups=c)
+        lt = F.conv2d(F.pad(lt, (0, 0, radius, radius), mode="reflect"),
+                      w.view(1, 1, -1, 1).expand(c, 1, -1, 1).contiguous(), groups=c)
+        return self._pack_lt_w_scale(lt, hw_scale)
+
+    def _scr_xscale(self):
+        """R_down / R_up for the relay (flux/xscale.py). --scr_xscale wins; unset falls back to the
+        legacy --relay_resampler (learned -> 'learned', bilinear -> 'bilinear'), so a run with every SCR
+        flag at its default reproduces the old relay."""
+        mode = getattr(self, "scr_xscale", None) or getattr(self, "relay_resampler", "learned")
+        return build_xscale(self, mode)
+
+    def _scr_flags(self):
+        keys = ("scr_ctx", "scr_xscale", "scr_band", "scr_promote", "scr_lr_restart", "scr_final_fill",
+                "scr_crop", "scr_fake_noise", "relay_resampler", "relay_gain", "relay_cut", "relay_text_bias")
+        return {k: getattr(self, k, None) for k in keys}
+
+    @torch.no_grad()
+    def _scr_preserve_init(self, z_lr, lr_x0, hr_noise, t_lr0, t_hr0, xs):
+        """--scr_promote preserve (spec §2.6): an HR start that keeps the LR noise realization.
+
+            eps_L = (z_L - (1 - s_L) x_L) / s_L      = the model's own noise estimate at the end of stage 1
+            eps_H = 1/2 U(eps_L) + (xi - U D xi)     U = nearest, D = avg-pool:  cov = P + (I - P) = I (white)
+            z_H   = (1 - s_H) R_up(x_L) + s_H eps_H
+
+        avg-pooling eps_H gives eps_L / 2, i.e. exactly what pooling a white HR field gives: the coarse
+        part of the HR noise IS the LR noise, and only the new octave (I - U D) gets fresh noise.
+        z_lr must be the stage-1 output, BEFORE any stage-2 LR re-noise."""
+        s_l = float(t_lr0) / 1000.0
+        s_h = float(t_hr0) / 1000.0
+        eps_l = (z_lr.float() - (1.0 - s_l) * lr_x0.float()) / s_l
+        el = self._unpack_latents(eps_l, self._h, self._w, self.vae_scale_factor)
+        xi = self._unpack_latents(hr_noise.float(), self._h * 2, self._w * 2, self.vae_scale_factor)
+        up_nn = lambda a: a.repeat_interleave(2, dim=-2).repeat_interleave(2, dim=-1)
+        eps_h = self._pack_lt_w_scale(0.5 * up_nn(el) + (xi - up_nn(F.avg_pool2d(xi, 2))), 2)
+        sig = xs.up(lr_x0).float()
+        z_h = (1.0 - s_h) * sig + s_h * eps_h
+        return z_h.to(hr_noise.dtype), sig.to(hr_noise.dtype), eps_h
+
+    @torch.no_grad()
+    def _scr_image_metrics(self, dec_hr, dec_lr, core_hr_mask_LR):
+        """Once per image, on the raw stream decodes BEFORE the feather (spec §5).
+        E_pix : RMSE(area_down(dec_hr), dec_lr) on core pixels eroded by 8 px (@1024), / std(dec_lr) there.
+        aniso : Ex/Ey of dec_hr luminance per 32-px core cell (Ex = mean (d/dx Y)^2, Ey = mean (d/dy Y)^2);
+                vertical streaks push it far above a uniform-HR reference."""
+        a = F.interpolate(dec_hr.float(), size=dec_lr.shape[-2:], mode="area")
+        b = dec_lr.float()
+        m512 = transform_base_mask(core_hr_mask_LR, 1, patch_size=16).float()
+        er = 1.0 - F.max_pool2d(1.0 - m512, kernel_size=9, stride=1, padding=4)     # erode 4 px @512
+        sel = (er > 0.5).expand_as(b)
+        out = {}
+        if sel.any():
+            rmse = torch.sqrt(((a - b)[sel] ** 2).mean())
+            out["E_pix"] = float(rmse / b[sel].std().clamp(min=1e-6))
+        rgb = dec_hr.float()
+        y = 0.299 * rgb[:, 0:1] + 0.587 * rgb[:, 1:2] + 0.114 * rgb[:, 2:3]
+        gx = F.pad((y[..., :, 1:] - y[..., :, :-1]) ** 2, (0, 1, 0, 0))
+        gy = F.pad((y[..., 1:, :] - y[..., :-1, :]) ** 2, (0, 0, 0, 1))
+        cell = dec_hr.shape[-1] // core_hr_mask_LR.shape[-1]                          # 32 px = 1 LR token
+        ratio = (F.avg_pool2d(gx, cell) / F.avg_pool2d(gy, cell).clamp(min=1e-8))[:, 0]
+        r = ratio[core_hr_mask_LR[:, 0]]
+        if r.numel():
+            out.update(aniso_mean=float(r.mean()), aniso_median=float(r.median()), aniso_max=float(r.max()))
+        return out
+
+    @torch.no_grad()
     def _native_lf_refresh(self, lt_up_lr_x0, hr_new, hr_x0, lr_new, hr_noise, lr_noise,
                            hr_seq_mask, bd1_mask, bd2_mask, next_t_hr, next_t_lr, hr_scale):
         """Native-context proxy refresh that does NOT throw away the HR band's detail.
@@ -175,70 +273,157 @@ class FluxPipeline(FluxPipeline_BASE):
     @torch.no_grad()
     def _relay_step(self, latents_lr, latents_hr, lr_x0_prev, t_lr, t_hr, timestep_lr, timestep_hr,
                     next_t_hr, sched_lr, sched_hr, lr_noise, core_seq_lr, core_seq_hr, hr_idx,
-                    guidance, pooled, prompt_embeds, text_ids, ids_lr, ids_hr, hr_scale):
-        """One stage-2 step of the RELAY (native_ctx="relay"): two separate native streams, no
-        cross-resolution attention anywhere, run in sequence so nothing lags.
+                    guidance, pooled, prompt_embeds, text_ids, ids_lr, ids_hr, hr_scale,
+                    core_hr_mask_LR=None):
+        """One stage-2 step of the RELAY (native_ctx="relay"), extended to SCR (SCR_method_spec.md).
 
-          1. HR stream: the HR region's tokens + text only (HR<->HR, HR<->text) -> HR x0.
-          2. Fake LR = down(HR x0) of the region, from THIS step's estimate, noised to the LR level.
-          3. LR stream: complete native LR canvas (real LR + fake LR) + text -> LR x0. The fake LR reads
-             the real LR around it at its own resolution.
-          4. Relay: the fake LR's change, up(LR x0 after) - up(fake LR before), low-passed to what an LR
-             grid can represent and restricted to the region, is added to the HR latent. HR keeps its own
-             high frequencies; only the low-frequency disagreement with its surroundings moves.
-        Using the difference of two up() calls cancels the resampler's bias (learned or bilinear)."""
+          1. HR pass -> x_H.  --scr_ctx none: the HR region's tokens + text only (old relay).
+                               --scr_ctx crpa: the plain-CRPA mixed forward, so HR queries also read the
+                               real LR tokens around the region (context); only its HR output is used.
+          2. Fake LR  f_L = R_down(x_H inside the region, R_up(last LR estimate) outside), noised to the LR
+             level with the fixed stage-2 LR noise and pasted into the LR canvas.
+          3. LR pass on the complete native 512 canvas -> x_L.  The fake reads the real LR around it.
+          4. Relay (delta form): d_H = m_H * B( R_up(x_L) - R_up(b_L) ),  b_L = x_L outside, f_L inside.
+             x_H += g d_H and z_H' += g (1 - s'_H) d_H.  d_H vanishes when the LR pass leaves the fake
+             unchanged, and a constant operator bias cancels in the difference.
+
+        R_up / R_down come from flux/xscale.py (--scr_xscale; unset = legacy --relay_resampler) and B is
+        --scr_band (brick = legacy brick-wall low-pass, gauss, none). With every SCR flag at its default
+        the same operations run in the same order as the old relay, so results reproduce bit-for-bit."""
         dt = latents_lr.dtype
-        learned = getattr(self, "relay_resampler", "learned") == "learned"
-        up_m, down_m = ("bi", "") if learned else ("bilinear", "avgpool")
         gain = float(getattr(self, "relay_gain", 1.0))
         cut = float(getattr(self, "relay_cut", 1.0))
+        ctx = getattr(self, "scr_ctx", "none")
+        band = getattr(self, "scr_band", "brick")
+        xs = self._scr_xscale()
+        batched = xs.mode not in ("bilinear", "learned")     # legacy modes keep separate calls (bit-identical)
+        cache = getattr(self, "_scr_cache", None)
+        if cache is None:
+            cache = self._scr_cache = {}
+        log = getattr(self, "_scr_log", None)
+        ms = {}
+        tm = functools.partial(_scr_timed, log is not None, ms)
 
-        # 1) HR stream (optional text-logit bias: a small window otherwise over-weights the 512 text keys)
-        kw = dict(self.joint_attention_kwargs or {})
-        tb = getattr(self, "relay_text_bias", 0.0)
-        n_txt, n_hr = prompt_embeds.shape[1], hr_idx.numel()
-        if tb == "auto":
-            tb = float(np.log(n_hr / float(latents_hr.shape[1])))      # visible / full-image HR tokens
-        tb = float(tb)
-        if tb != 0.0:
-            m = torch.zeros(1, 1, 1, n_txt + n_hr, device=latents_hr.device, dtype=dt)
-            m[..., :n_txt] = tb
-            kw["attention_mask"] = m
-        ids_hr2 = ids_hr[0] if ids_hr.ndim == 3 else ids_hr
-        with self.transformer.cache_context("cond"):
-            v_hr = self.transformer(
-                hidden_states=latents_hr[:, hr_idx], timestep=timestep_hr / 1000, guidance=guidance,
-                pooled_projections=pooled, encoder_hidden_states=prompt_embeds, txt_ids=text_ids,
-                img_ids=ids_hr2[hr_idx], joint_attention_kwargs=kw, return_dict=False)[0]
-        pred_hr = torch.zeros_like(latents_hr)
-        pred_hr[:, hr_idx] = v_hr.to(pred_hr.dtype)
+        # 1) HR pass
+        with tm("hr_pass"):
+            if ctx == "crpa":
+                # plain CRPA (no E&R, no overlap): LR tokens outside the region + HR tokens of the region.
+                # forward_mixed behaves differently when the transformer's native_ctx != "off", so it is
+                # switched off for this call only (the pipeline's own native_ctx stays "relay").
+                if core_hr_mask_LR is None:
+                    raise ValueError("scr_ctx='crpa' needs core_hr_mask_LR")
+                tf = self.transformer
+                saved = getattr(tf, "native_ctx", "off")
+                tf.native_ctx = "off"
+                try:
+                    with tf.cache_context("cond"):
+                        _, out_hr = tf.forward_mixed(
+                            hidden_states_lr=latents_lr, hidden_states_hr=latents_hr,
+                            mask_lr_tokens=core_hr_mask_LR, mask_lr_keep_tokens=~core_hr_mask_LR,
+                            timestep_lr=timestep_lr / 1000, timestep_hr=timestep_hr / 1000,
+                            guidance=guidance, pooled_projections=pooled, encoder_hidden_states=prompt_embeds,
+                            txt_ids=text_ids, img_ids_lr=ids_lr, img_ids_hr=ids_hr,
+                            joint_attention_kwargs=self.joint_attention_kwargs)
+                finally:
+                    tf.native_ctx = saved
+                # forward_mixed returns the INPUT latent at tokens it did not process: zero them, so tokens
+                # outside the region stay put under the scheduler step (as in the context-free pass).
+                pred_hr = (out_hr.float() * core_seq_hr).to(latents_hr.dtype)
+            elif ctx == "none":
+                # HR region tokens + text only (optional text-logit bias: a small window otherwise
+                # over-weights the 512 text keys)
+                kw = dict(self.joint_attention_kwargs or {})
+                tb = getattr(self, "relay_text_bias", 0.0)
+                n_txt, n_hr = prompt_embeds.shape[1], hr_idx.numel()
+                if tb == "auto":
+                    tb = float(np.log(n_hr / float(latents_hr.shape[1])))      # visible / full-image HR tokens
+                tb = float(tb)
+                if tb != 0.0:
+                    m = torch.zeros(1, 1, 1, n_txt + n_hr, device=latents_hr.device, dtype=dt)
+                    m[..., :n_txt] = tb
+                    kw["attention_mask"] = m
+                ids_hr2 = ids_hr[0] if ids_hr.ndim == 3 else ids_hr
+                with self.transformer.cache_context("cond"):
+                    v_hr = self.transformer(
+                        hidden_states=latents_hr[:, hr_idx], timestep=timestep_hr / 1000, guidance=guidance,
+                        pooled_projections=pooled, encoder_hidden_states=prompt_embeds, txt_ids=text_ids,
+                        img_ids=ids_hr2[hr_idx], joint_attention_kwargs=kw, return_dict=False)[0]
+                pred_hr = torch.zeros_like(latents_hr)
+                pred_hr[:, hr_idx] = v_hr.to(pred_hr.dtype)
+            else:
+                raise ValueError(f"unknown scr_ctx {ctx!r}")
         hr_new, hr_x0 = sched_hr.step(pred_hr, t_hr, latents_hr, return_dict=False)
 
-        # 2) fake LR from this step's HR estimate (clean composite so never-processed tokens can't leak)
-        lr_prev_up, _ = self._resize_x0_to_x0(lr_x0_prev, hr_scale, up_m, ori_scale=1)
-        hr_comp = (hr_x0.float() * core_seq_hr + lr_prev_up.float() * (1 - core_seq_hr)).to(dt)
-        fake_x0, _ = self._resize_x0_to_x0(hr_comp, 1.0 / hr_scale, down_m, ori_scale=hr_scale)
-        fake_in = self._add_noise_at_t(fake_x0, lr_noise, t_lr)
+        # 2) fake LR from this step's HR estimate. The composite gives the operator's receptive field real
+        # context outside the region: R_up of the last LR estimate, reused from the previous relay call.
+        with tm("xs_fill"):
+            fill = cache.pop("up_after", None)
+            if fill is None:
+                fill = xs.up(lr_x0_prev)
+        hr_comp = (hr_x0.float() * core_seq_hr + fill.float() * (1 - core_seq_hr)).to(dt)
+        with tm("xs_down"):
+            fake_x0 = xs.down(hr_comp)
+        if getattr(self, "scr_fake_noise", "fixed") == "matched":
+            # noise-matched fake: give the fake the HR stream's OWN noise realization, viewed at 512, instead
+            # of the fixed stage-2 LR noise. eps_H = (z_H - (1 - s_H) x_H) / s_H is the HR pass's noise estimate;
+            # 2 * avgpool(eps_H) is white with unit variance and is exactly what a 512 grid sees of it. The LR
+            # pass then re-estimates a view of HR's own noisy state, so its change carries no detail driven by a
+            # foreign noise realization (the colour speckle of the pixel-operator relay).
+            s_h = float(t_hr) / 1000.0
+            eps_h = (latents_hr.float() - (1.0 - s_h) * hr_x0.float()) / s_h
+            e = self._unpack_latents(eps_h, self._h * hr_scale, self._w * hr_scale, self.vae_scale_factor)
+            fake_noise = self._pack_lt_w_scale(2.0 * F.avg_pool2d(e, 2), 1)
+            fake_in = self._add_noise_at_t(fake_x0, fake_noise, t_lr)
+        else:
+            fake_in = self._add_noise_at_t(fake_x0, lr_noise, t_lr)
         lr_in = (latents_lr.float() * (1 - core_seq_lr) + fake_in.float() * core_seq_lr).to(dt)
 
-        # 3) LR stream: complete native LR canvas
-        with self.transformer.cache_context("cond"):
-            v_lr = self.transformer(
-                hidden_states=lr_in, timestep=timestep_lr / 1000, guidance=guidance,
-                pooled_projections=pooled, encoder_hidden_states=prompt_embeds, txt_ids=text_ids,
-                img_ids=ids_lr, joint_attention_kwargs=self.joint_attention_kwargs, return_dict=False)[0]
+        # 3) LR pass: complete native LR canvas
+        with tm("lr_pass"):
+            with self.transformer.cache_context("cond"):
+                v_lr = self.transformer(
+                    hidden_states=lr_in, timestep=timestep_lr / 1000, guidance=guidance,
+                    pooled_projections=pooled, encoder_hidden_states=prompt_embeds, txt_ids=text_ids,
+                    img_ids=ids_lr, joint_attention_kwargs=self.joint_attention_kwargs, return_dict=False)[0]
         lr_new, lr_x0 = sched_lr.step(v_lr, t_lr, lr_in, return_dict=False)
 
-        # 4) relay the fake LR's change down to the HR region (low frequencies only)
+        # 4) relay the fake LR's change to the HR region (delta form, band-filtered)
+        delta, hr_x0_before = None, hr_x0
         if gain != 0.0:
             before = (lr_x0.float() * (1 - core_seq_lr) + fake_x0.float() * core_seq_lr).to(dt)
-            up_after, _ = self._resize_x0_to_x0(lr_x0, hr_scale, up_m, ori_scale=1)
-            up_before, _ = self._resize_x0_to_x0(before, hr_scale, up_m, ori_scale=1)
-            corr = self._lowpass_packed((up_after.float() - up_before.float()).to(dt), hr_scale,
-                                        cut_scale=cut).float() * core_seq_hr * gain
+            with tm("xs_up"):
+                if batched:                                   # one call for u_a and u_b
+                    n = lr_x0.shape[0]
+                    u = xs.up(torch.cat([lr_x0, before], dim=0))
+                    up_after, up_before = u[:n], u[n:]
+                else:
+                    up_after = xs.up(lr_x0)
+                    up_before = xs.up(before)
+            if band == "brick":
+                d = self._lowpass_packed((up_after.float() - up_before.float()).to(dt), hr_scale,
+                                         cut_scale=cut).float()
+            elif band == "gauss":
+                d = self._gauss_packed(up_after.float() - up_before.float(), hr_scale).float()
+            elif band == "none":
+                d = up_after.float() - up_before.float()
+            else:
+                raise ValueError(f"unknown scr_band {band!r}")
+            delta = d * core_seq_hr
+            corr = delta * gain
             sig = next_t_hr.reshape(1).float()[0] * 1e-3 if next_t_hr is not None else 0.0
             hr_new = (hr_new.float() + (1.0 - sig) * corr).to(hr_new.dtype)
             hr_x0 = (hr_x0.float() + corr).to(hr_x0.dtype)
+            cache["up_after"] = up_after                      # = R_up(x_L): next step's fill
+
+        if log is not None:
+            def _rel(a, b):
+                return float(a.float().norm() / b.float().norm().clamp(min=1e-12))
+            rec = {"t_lr": float(t_lr) / 1000.0, "t_hr": float(t_hr) / 1000.0,
+                   "cons": _rel((lr_x0.float() - fake_x0.float()) * core_seq_lr, lr_x0.float() * core_seq_lr),
+                   "t_ms": {k: round(v, 2) for k, v in ms.items()}}
+            if delta is not None:
+                rec["relay"] = _rel(delta, hr_x0_before.float() * core_seq_hr)
+            log["steps"].append(rec)
         return lr_new, hr_new, lr_x0, hr_x0
 
     @torch.no_grad()
@@ -471,6 +656,7 @@ class FluxPipeline(FluxPipeline_BASE):
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
         self._h, self._w = height, width
+        self._scr_log, self._scr_streams, self._scr_cache = None, None, {}     # SCR per-image state (relay only)
 
         self.check_inputs(
             prompt,
@@ -797,7 +983,21 @@ class FluxPipeline(FluxPipeline_BASE):
             stage2_start_t_lr = timesteps_stg2_lr[0]
             stage2_start_t_hr = timesteps_stg2_hr[0]
 
-            if getattr(self, "invert_hr_init", False):
+            # SCR (relay only): per-image state, operator crop, and the two stage-2 entry options (spec §2.6)
+            _scr = _nc == "relay"
+            if _scr:
+                if hr_scale != 2:
+                    raise ValueError("the relay / SCR assumes hr_scale == 2")
+                self._scr_cache = {}
+                self._scr_log = {"steps": [], "flags": self._scr_flags()} if getattr(self, "scr_log", False) else None
+                _xs = self._scr_xscale()
+                _xs.set_crop(core_hr_mask_LR if getattr(self, "scr_crop", False) else None)
+
+            if _scr and getattr(self, "scr_promote", "renoise") == "preserve":
+                # noise-realization-preserving HR start; uses the stage-1 state z_L BEFORE any re-noise
+                latents_hr, latents_hr_x0, _ = self._scr_preserve_init(
+                    latents_lr, latents_lr_x0, latents_hr_noise, stage2_start_t_lr, stage2_start_t_hr, _xs)
+            elif getattr(self, "invert_hr_init", False):
                 # STRUCTURE-LOCKED HR init: flow-invert the upsampled-LR x0 up to the start sigma,
                 # instead of adding a fresh random HR noise. Keeps the HR grid phase-locked to LR
                 # (less divergence -> smaller seam), the mechanism that should let us drop E&R.
@@ -807,7 +1007,10 @@ class FluxPipeline(FluxPipeline_BASE):
                     pooled_prompt_embeds, prompt_embeds, text_ids)
             else:
                 latents_hr = self._add_noise_at_t(latents_hr_x0, latents_hr_noise, stage2_start_t_hr)
-            latents_lr = self._add_noise_at_t(latents_lr_x0, stage2_lr_noise, stage2_start_t_lr)
+            if not (_scr and getattr(self, "scr_lr_restart", "on") == "off"):
+                # re-noise the LR canvas at the stage-2 start (default). --scr_lr_restart off keeps the
+                # stage-1 state: stage 2 starts at the sigma index where stage 1 stopped, a pure continuation.
+                latents_lr = self._add_noise_at_t(latents_lr_x0, stage2_lr_noise, stage2_start_t_lr)
 
             if getattr(self, "_dump_hr_init", False):
                 # DIAGNOSTIC (flux.size_check): how much fresh noise buries the LR structure at the
@@ -847,16 +1050,22 @@ class FluxPipeline(FluxPipeline_BASE):
                                                  "b c h w -> b (h w) c").to(latents_lr.device)
                         relay_seq_hr = actual_hr_mask.float()
                         relay_idx = actual_hr_mask[0, :, 0].nonzero().squeeze(1)
+                        if getattr(self, "scr_ctx", "none") == "crpa":
+                            self.transformer._mixed_mask_cache = None     # masks are constant afterwards
                         print(f"[relay] HR stream = {relay_idx.numel()} tokens "
                               f"({relay_idx.numel() / actual_hr_mask.shape[1]:.2f} of the image), "
-                              f"resampler={getattr(self, 'relay_resampler', 'learned')} "
-                              f"gain={getattr(self, 'relay_gain', 1.0)} cut={getattr(self, 'relay_cut', 1.0)} "
-                              f"text_bias={getattr(self, 'relay_text_bias', 0.0)}")
+                              f"xscale={self._scr_xscale().mode} band={getattr(self, 'scr_band', 'brick')} "
+                              f"ctx={getattr(self, 'scr_ctx', 'none')} gain={getattr(self, 'relay_gain', 1.0)} "
+                              f"cut={getattr(self, 'relay_cut', 1.0)} text_bias={getattr(self, 'relay_text_bias', 0.0)} "
+                              f"promote={getattr(self, 'scr_promote', 'renoise')} "
+                              f"lr_restart={getattr(self, 'scr_lr_restart', 'on')} "
+                              f"fake_noise={getattr(self, 'scr_fake_noise', 'fixed')}")
                     latents_lr, latents_hr, latents_lr_x0, latents_hr_x0 = self._relay_step(
                         latents_lr, latents_hr, latents_lr_x0, t_lr, t_hr, timestep_lr, timestep_hr,
                         next_t_hr, scheduler_stg2_lr, scheduler_stg2_hr, stage2_lr_noise,
                         relay_seq_lr, relay_seq_hr, relay_idx, guidance, pooled_prompt_embeds,
-                        prompt_embeds, text_ids, latent_lr_image_ids, latent_hr_image_ids, hr_scale)
+                        prompt_embeds, text_ids, latent_lr_image_ids, latent_hr_image_ids, hr_scale,
+                        core_hr_mask_LR=core_hr_mask_LR)
                     if getattr(self, "_trace_steps", False):
                         self._trace_dump(j, latents_hr_x0, latents_lr_x0, actual_hr_mask,
                                          core_hr_mask_LR, feather_radius, hr_scale)
@@ -955,13 +1164,24 @@ class FluxPipeline(FluxPipeline_BASE):
         # fill: lr with hr | hr with lr
         lt_lr_fake, _ = self._resize_x0_to_x0(latents_hr, 1./hr_scale, "repeat", ori_scale=hr_scale, align_mean=False)
         latents_lr = latents_lr * actual_lr_mask + lt_lr_fake * (1. - actual_lr_mask)
-        lt_hr_fake, _ = self._resize_x0_to_x0(latents_lr, hr_scale, "repeat", ori_scale=1, align_mean=False)
+        if _nc == "relay" and getattr(self, "scr_final_fill", "repeat") == "xscale":
+            # SCR §2.7: fill the HR latent outside the core with R_up(LR) instead of nearest-upsampled latents,
+            # so inside the 28 px feather dec_hr is ~ a round trip of the LR image rather than off-manifold.
+            lt_hr_fake = self._scr_xscale().up(latents_lr)
+        else:
+            lt_hr_fake, _ = self._resize_x0_to_x0(latents_lr, hr_scale, "repeat", ori_scale=1, align_mean=False)
         latents_hr = latents_hr * actual_hr_mask + lt_hr_fake * (1. - actual_hr_mask)
 
         # apply distance feather on mask
         dec_lr = self._vae1_decode(latents_lr, hw_scale=1, need_unpack=True)
-        dec_lr_up = F.interpolate(dec_lr, scale_factor=hr_scale, mode="bicubic", align_corners=False).clamp_(-1.0, 1.0) 
+        dec_lr_up = F.interpolate(dec_lr, scale_factor=hr_scale, mode="bicubic", align_corners=False).clamp_(-1.0, 1.0)
         dec_hr = self._vae1_decode(latents_hr, hw_scale=2, need_unpack=True) # (1, 3, 1024, 1024)
+        if _nc == "relay":
+            if self._scr_log is not None:                      # raw streams, before the feather (spec §5)
+                self._scr_log.update(self._scr_image_metrics(dec_hr, dec_lr, core_hr_mask_LR))
+            if getattr(self, "scr_dump_streams", False):
+                self._scr_streams = {"dec_hr": self.image_processor.postprocess(dec_hr, output_type="pil")[0],
+                                     "dec_lr": self.image_processor.postprocess(dec_lr, output_type="pil")[0]}
         core_hr_mask_pix = transform_base_mask(core_hr_mask_LR, hr_scale, patch_size=16) 
         core_hr_mask_pix_feather = feather_mask_from_bool(core_hr_mask_pix, radius=feather_radius)
         image = dec_lr_up.float() * (1. - core_hr_mask_pix_feather) + dec_hr.float() * core_hr_mask_pix_feather

@@ -80,7 +80,13 @@ def save_case(pipe, image, args, tag, category, i, prompt):
     m = pipe._last_hr_mask_LR.float()                       # [b,1,ht,wt]
     m_full = F.interpolate(m, size=(fine, fine), mode="nearest")[0, 0] > 0.5
     np.save(os.path.join(d, "mask.npy"), m_full.cpu().numpy())
-    json.dump(dict(category=category, prompt=prompt), open(os.path.join(d, "meta.json"), "w"))
+    meta = dict(category=category, prompt=prompt)
+    if getattr(pipe, "_scr_log", None) is not None:          # SCR diagnostics + flag values (--scr_log)
+        meta["scr"] = pipe._scr_log
+    json.dump(meta, open(os.path.join(d, "meta.json"), "w"), indent=1)
+    if getattr(pipe, "_scr_streams", None):                   # raw HR / LR decodes, no feather (--scr_dump_streams)
+        for k, im in pipe._scr_streams.items():
+            im.save(os.path.join(d, f"{k}.png"))
 
 
 def run_one(pipe, args, prompt, pad):
@@ -109,6 +115,28 @@ def main(args):
     pipe.relay_gain = args.relay_gain
     pipe.relay_cut = args.relay_cut
     pipe.relay_text_bias = args.relay_text_bias if args.relay_text_bias == "auto" else float(args.relay_text_bias)
+    # SCR (Scale-Consistent Relay, SCR_method_spec.md). Every default reproduces the old relay.
+    scr_set = [f for f, v, d in [("--scr_ctx", args.scr_ctx, "none"), ("--scr_xscale", args.scr_xscale, None),
+                                 ("--scr_band", args.scr_band, "brick"), ("--scr_promote", args.scr_promote, "renoise"),
+                                 ("--scr_lr_restart", args.scr_lr_restart, "on"),
+                                 ("--scr_final_fill", args.scr_final_fill, "repeat"), ("--scr_crop", args.scr_crop, False),
+                                 ("--scr_log", args.scr_log, False), ("--scr_dump_streams", args.scr_dump_streams, False),
+                                 ("--scr_fake_noise", args.scr_fake_noise, "fixed")]
+               if v != d]
+    if scr_set and args.native_ctx != "relay":
+        raise SystemExit(f"{', '.join(scr_set)} only act with --native_ctx relay")
+    if args.scr_promote == "preserve" and args.invert_hr:
+        raise SystemExit("--scr_promote preserve and --invert_hr both set the HR start; pick one")
+    pipe.scr_ctx = args.scr_ctx
+    pipe.scr_xscale = args.scr_xscale
+    pipe.scr_band = args.scr_band
+    pipe.scr_promote = args.scr_promote
+    pipe.scr_lr_restart = args.scr_lr_restart
+    pipe.scr_final_fill = args.scr_final_fill
+    pipe.scr_crop = args.scr_crop
+    pipe.scr_log = args.scr_log
+    pipe.scr_dump_streams = args.scr_dump_streams
+    pipe.scr_fake_noise = args.scr_fake_noise
     pipe.native_band_mode = args.native_band_mode               # lf = band keeps own detail; replace = plain E&R
     pipe.invert_hr_init = args.invert_hr        # structure-locked HR init (flow-inversion vs random)
     pipe.invert_hr_steps = args.invert_steps
@@ -188,6 +216,31 @@ if __name__ == "__main__":
                     help="relay: low-pass cutoff as a fraction of the LR Nyquist (1 = all an LR grid can hold)")
     ap.add_argument("--relay_text_bias", default="0",
                     help="relay: logit bias on text keys in the HR stream; 'auto' = log(HR tokens / full-image tokens)")
+    # --- SCR (Scale-Consistent Relay): all defaults reproduce the old --native_ctx relay ---
+    ap.add_argument("--scr_ctx", choices=["none", "crpa"], default="none",
+                    help="relay HR pass: none = HR region + text only; crpa = plain-CRPA mixed forward, so HR "
+                         "queries also read the real LR tokens around the region (context)")
+    ap.add_argument("--scr_xscale", choices=["bilinear", "haar", "taef1", "vae", "learned"], default=None,
+                    help="cross-scale operator for the fake LR and the relay (flux/xscale.py); unset = --relay_resampler")
+    ap.add_argument("--scr_band", choices=["none", "gauss", "brick"], default="brick",
+                    help="band filter on the relay correction: brick = legacy brick-wall low-pass (uses --relay_cut), "
+                         "gauss = Gaussian sigma 0.75 latent px, none = identity")
+    ap.add_argument("--scr_promote", choices=["renoise", "preserve"], default="renoise",
+                    help="stage-2 HR start: renoise = fresh HR noise (legacy); preserve = coarse HR noise = the LR "
+                         "noise realization, fresh noise only in the new octave")
+    ap.add_argument("--scr_lr_restart", choices=["on", "off"], default="on",
+                    help="on = re-noise the LR canvas at stage-2 start (legacy); off = continue the stage-1 state")
+    ap.add_argument("--scr_final_fill", choices=["repeat", "xscale"], default="repeat",
+                    help="final-decode HR fill outside the core: repeat = nearest latents (legacy); xscale = R_up(LR)")
+    ap.add_argument("--scr_fake_noise", choices=["fixed", "matched"], default="fixed",
+                    help="noise of the fake LR: fixed = the stage-2 LR noise (legacy); matched = the HR stream's own "
+                         "noise estimate pooled to 512, 2*avgpool(eps_H)")
+    ap.add_argument("--scr_crop", action="store_true",
+                    help="run the pixel-space operators (taef1/vae) only on the region's bounding box + 64 px")
+    ap.add_argument("--scr_log", action="store_true",
+                    help="store per-step cons/relay/timings and per-image E_pix/aniso in meta.json under 'scr'")
+    ap.add_argument("--scr_dump_streams", action="store_true",
+                    help="also save the raw dec_hr.png / dec_lr.png (no feather) next to mixed.png")
     ap.add_argument("--native_band", type=int, default=2, help="HR proxy band around the core, in LR cells")
     ap.add_argument("--native_band_mode", choices=["lf", "replace"], default="lf",
                     help="lf = band keeps its own high frequencies, only low frequencies locked to LR; "
