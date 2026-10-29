@@ -90,11 +90,14 @@ def save_case(pipe, image, args, tag, category, i, prompt):
 
 
 def run_one(pipe, args, prompt, pad):
+    # --pad_lr / --pad_hr override the two E&R halves separately (Phase Q / X4), only when E&R is on
+    pad1 = args.pad_lr if (pad > 0 and args.pad_lr is not None) else pad
+    pad2 = args.pad_hr if (pad > 0 and args.pad_hr is not None) else pad
     return pipe(
         prompt, height=args.height, width=args.width, guidance_scale=args.guidance_scale,
         generator=torch.Generator("cpu").manual_seed(args.seed),
         hr_ratio=args.hr_ratio, stg1_true_steps=args.stg1_steps, stg2_true_steps=args.stg2_steps,
-        mask_type=args.mask_type, pad1=pad, pad2=pad, boundary_grad=args.boundary_grad,
+        mask_type=args.mask_type, pad1=pad1, pad2=pad2, boundary_grad=args.boundary_grad,
     ).images[0]
 
 
@@ -120,8 +123,7 @@ def main(args):
                                  ("--scr_band", args.scr_band, "brick"), ("--scr_promote", args.scr_promote, "renoise"),
                                  ("--scr_lr_restart", args.scr_lr_restart, "on"),
                                  ("--scr_final_fill", args.scr_final_fill, "repeat"), ("--scr_crop", args.scr_crop, False),
-                                 ("--scr_log", args.scr_log, False), ("--scr_dump_streams", args.scr_dump_streams, False),
-                                 ("--scr_fake_noise", args.scr_fake_noise, "fixed")]
+                                 ("--scr_log", args.scr_log, False), ("--scr_fake_noise", args.scr_fake_noise, "fixed")]
                if v != d]
     if scr_set and args.native_ctx != "relay":
         raise SystemExit(f"{', '.join(scr_set)} only act with --native_ctx relay")
@@ -137,6 +139,15 @@ def main(args):
     pipe.scr_log = args.scr_log
     pipe.scr_dump_streams = args.scr_dump_streams
     pipe.scr_fake_noise = args.scr_fake_noise
+    # Phase Q / X2: pixel-space operators in setup C's proxy refresh, single-owner final core
+    if (args.native_xscale or args.native_final_core != "lr") and args.native_ctx not in ("near", "full"):
+        raise SystemExit("--native_xscale / --native_final_core need --native_ctx near|full")
+    if args.native_xscale and args.native_band_mode != "replace":
+        raise SystemExit("--native_xscale needs --native_band_mode replace (lf keeps the learned / brick-wall ops)")
+    if (args.pad_lr is not None or args.pad_hr is not None) and args.native_ctx != "off":
+        raise SystemExit("--pad_lr / --pad_hr are for plain E&R (--native_ctx off); native modes set their own bands")
+    pipe.native_xscale = args.native_xscale
+    pipe.native_final_core = args.native_final_core
     pipe.native_band_mode = args.native_band_mode               # lf = band keeps own detail; replace = plain E&R
     pipe.invert_hr_init = args.invert_hr        # structure-locked HR init (flow-inversion vs random)
     pipe.invert_hr_steps = args.invert_steps
@@ -235,6 +246,14 @@ if __name__ == "__main__":
     ap.add_argument("--scr_fake_noise", choices=["fixed", "matched"], default="fixed",
                     help="noise of the fake LR: fixed = the stage-2 LR noise (legacy); matched = the HR stream's own "
                          "noise estimate pooled to 512, 2*avgpool(eps_H)")
+    ap.add_argument("--native_xscale", choices=["taef1", "vae"], default=None,
+                    help="Phase Q X2: setup C's proxy refresh uses pixel-space operators (flux/xscale.py) instead of the "
+                         "learned E&R resizers; needs --native_ctx near|full --native_band_mode replace")
+    ap.add_argument("--native_final_core", choices=["lr", "hr"], default="lr",
+                    help="native modes, final render: hr = the LR canvas inside the core is R_down(final HR) "
+                         "(single owner in the feather); lr = the LR model's last estimate (legacy)")
+    ap.add_argument("--pad_lr", type=int, default=None, help="E&R inner (LR) band only, overrides --pad (Phase Q X4)")
+    ap.add_argument("--pad_hr", type=int, default=None, help="E&R outer (HR) band only, overrides --pad (Phase Q X4)")
     ap.add_argument("--scr_crop", action="store_true",
                     help="run the pixel-space operators (taef1/vae) only on the region's bounding box + 64 px")
     ap.add_argument("--scr_log", action="store_true",

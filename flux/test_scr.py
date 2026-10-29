@@ -17,6 +17,9 @@ imports diffusers), bound to a stub pipeline with a mock transformer and a mock 
     T10 image metrics                  aniso ~1 on isotropic texture, >> 1 on vertical streaks; E_pix rises
                                        when dec_hr departs from the upsampled dec_lr
     T11 matched fake noise             --scr_fake_noise matched feeds the LR pass (1-s_L) D(x_H) + s_L 2 D(eps_H)
+    T12 eps whiteness (Phase Q X3)     white eps -> band densities ~1, lag1 ~0 on small and salblock-like masks;
+                                       LR-scale content relabelled as noise raises b0/b1 and lowers b3
+    T13 offline metrics (Phase Q X5)   grid_lock / row_period / tex_ratio / seam_jump on synthetic images
     T5  (GPU, --gpu)                   taef1 / vae round-trip error and shift on real latents
 
     python -m flux.test_scr            # from mixed_res_dit/
@@ -42,7 +45,7 @@ PIPE_SRC = os.path.join(HERE, "pipeline_flux_2stg.py")
 HELPERS_SRC = os.path.join(HERE, "utils", "helpers.py")
 LEGACY_REV = "2026d21"
 METHODS = ("_pack_lt_w_scale", "_resize_x0_to_x0", "_add_noise_at_t", "_lowpass_packed", "_gauss_packed",
-           "_scr_xscale", "_scr_flags", "_scr_preserve_init", "_relay_step", "_scr_image_metrics")
+           "_scr_xscale", "_scr_flags", "_scr_preserve_init", "_relay_step", "_scr_image_metrics", "_scr_eps_stats")
 
 
 # ----------------------------------------------------------------------------------------------- loading
@@ -394,6 +397,61 @@ def t11_matched_noise():
     return f"region err {err:.1e}, outside untouched, matched noise std {noise.std():.3f}"
 
 
+def t12_eps_stats():
+    """X3: white eps reads ~1 in every band whatever the mask; LR-scale content relabelled as noise does not."""
+    p = make_stub()
+    geo = geometry()
+    g = torch.Generator().manual_seed(12)
+    sb = torch.zeros(1, 1, 32, 32, dtype=torch.bool)
+    rng = np.random.default_rng(0)
+    for _ in range(26):                                                  # salblock-like: 2x2-cell blocks, ~10%
+        y, x = rng.integers(0, 15, 2) * 2
+        sb[..., y:y + 2, x:x + 2] = True
+    res = {}
+    for name, core in (("small", geo["core"].expand(8, -1, -1, -1)), ("sb", sb.expand(8, -1, -1, -1))):
+        white = torch.randn(8, 4096, 64, generator=g)
+        w = p._scr_eps_stats(white, core)
+        assert all(0.85 < w[f"b{k}"] < 1.15 for k in range(4)) and abs(w["lag1"]) < 0.02, (name, w)
+        res[name] = w
+    low = F.interpolate(torch.randn(8, 16, 32, 32, generator=g), size=(128, 128), mode="bilinear", align_corners=False)
+    r = p._scr_eps_stats(torch.randn(8, 4096, 64, generator=g) + _pack(low, 8, 16, 128, 128), geo["core"].expand(8, -1, -1, -1))
+    assert r["b0"] > 4 and r["b1"] > 3 and r["b3"] < 0.85 and r["lag1"] > 0.15, r
+    return (f"white small {[res['small'][f'b{k}'] for k in range(4)]} lag1 {res['small']['lag1']:+.3f}; "
+            f"white sb {[res['sb'][f'b{k}'] for k in range(4)]}; relabelled b0 {r['b0']:.1f} b1 {r['b1']:.1f} "
+            f"b3 {r['b3']:.2f} lag1 {r['lag1']:.2f}")
+
+
+def t13_offline_metrics():
+    """X5: the offline metrics on synthetic images with known answers."""
+    from scipy import ndimage
+    from .scr_metrics import grid_lock, row_period, tex_ratio, seam_jump
+    rng = np.random.default_rng(13)
+    noise = rng.standard_normal((256, 256)) * 10
+    m = np.ones((256, 256), bool)
+    free = grid_lock(noise, m, 8)["amp"]
+    locked = grid_lock(noise + np.tile(rng.standard_normal((8, 8)) * 5, (32, 32)), m, 8)["amp"]
+    assert free < 0.05 and locked > 0.3, (free, locked)
+    yy = np.arange(128)[:, None] * np.ones((1, 128))
+    per = row_period(np.sin(2 * np.pi * yy / 20) + 0.1 * rng.standard_normal((128, 128)))[0]
+    assert abs(per - 20) < 0.5, per
+    H = 768
+    yy = np.arange(H)[:, None] * np.ones((1, H))
+    mask = np.zeros((H, H), bool)
+    mask[256:512, 256:512] = True
+    tex = tex_ratio(100 * np.sin(2 * np.pi * yy / 12) + rng.standard_normal((H, H)),
+                    100 * np.sin(2 * np.pi * yy / 30) + rng.standard_normal((H, H)), mask)["ratio"]
+    assert abs(tex - 0.4) < 0.03, tex
+    H = 1024
+    f = np.stack([ndimage.gaussian_filter(rng.standard_normal((H, H)), 12) for _ in range(3)], -1)
+    f = (f - f.min()) / (f.max() - f.min()) * 255
+    mask = np.zeros((H, H), bool)
+    mask[384:640, 384:640] = True
+    same, shifted = seam_jump(f, f, mask)["ratio"], seam_jump(np.roll(f, 40, 1), f, mask)["ratio"]
+    assert abs(same - 1) < 0.05 and shifted > 3, (same, shifted)
+    return (f"grid lock P8 free {free:.3f} / locked {locked:.2f}; period {per:.2f} (20); tex ratio {tex:.3f} (0.4); "
+            f"seam same {same:.3f}, 40-px shift {shifted:.1f}")
+
+
 def t5_gpu(device, images, n=8):
     """taef1 / vae round trip on real latents: |down(up(x)) - x| / |x| and the low-frequency shift."""
     import glob
@@ -430,7 +488,8 @@ def main(args):
              ("T3 promotion whiteness", t3_promotion_whiteness), ("T4 legacy reproduction", t4_legacy_reproduction),
              ("T6 gain-0 regression", t6_gain0), ("T7 crpa context", t7_crpa_context),
              ("T8 band filters", t8_band_filters), ("T9 region crop", t9_crop), ("T10 image metrics", t10_metrics),
-             ("T11 matched fake noise", t11_matched_noise)]
+             ("T11 matched fake noise", t11_matched_noise), ("T12 eps whiteness", t12_eps_stats),
+             ("T13 offline metrics", t13_offline_metrics)]
     failed = 0
     for name, fn in tests:
         try:

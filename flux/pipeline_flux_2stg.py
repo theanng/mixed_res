@@ -221,6 +221,38 @@ class FluxPipeline(FluxPipeline_BASE):
         return z_h.to(hr_noise.dtype), sig.to(hr_noise.dtype), eps_h
 
     @torch.no_grad()
+    def _scr_eps_stats(self, eps_h, core_hr_mask_LR):
+        """Phase Q / X3: is the HR stream's noise estimate still white inside the core?
+        eps_h: packed [B,4096,64] = (z_H - (1 - s_H) x_H) / s_H. On the unpacked latent (16 ch, 128x128):
+          band_k : power in radial bands (cycles / HR-latent px) relative to white noise of the same variance on
+                   the same mask (exact reference E|FFT(m (e - mean))|^2 = var (n - |FFT m|^2 / n)), so white = 1 in
+                   every band for any mask shape. A spectral SHAPE: content added in one band raises it, lowers the rest.
+                   b0 [0,1/16) b1 [1/16,1/8) b2 [1/8,1/4) = the band a 512 grid can hold, b3 [1/4,0.75) above it
+          lag1   : mean lag-1 spatial autocorrelation over channels, x and y (white = 0)
+        Relabelled relay content should raise b0-b2 step by step (toy C), and lag1 with it."""
+        e = self._unpack_latents(eps_h.float(), self._h * 2, self._w * 2, self.vae_scale_factor)   # [B,16,128,128]
+        m = core_hr_mask_LR.float().repeat_interleave(4, -2).repeat_interleave(4, -1)              # [B,1,128,128]
+        n = m.sum((-2, -1), keepdim=True).clamp(min=1.0)
+        em = (e - (e * m).sum((-2, -1), keepdim=True) / n) * m
+        var = (em ** 2).sum((-2, -1), keepdim=True) / n                                             # [B,16,1,1]
+        P = torch.fft.fft2(em).abs() ** 2                                                           # [B,16,128,128]
+        ref = (var * (n - torch.fft.fft2(m).abs() ** 2 / n)).expand_as(P)                          # white reference
+        fy = torch.fft.fftfreq(e.shape[-2], device=e.device).abs()[:, None]
+        fx = torch.fft.fftfreq(e.shape[-1], device=e.device).abs()[None, :]
+        r = torch.sqrt(fy ** 2 + fx ** 2)
+        out = {}
+        for k, (lo, hi) in enumerate(((0.0, 1 / 16), (1 / 16, 1 / 8), (1 / 8, 1 / 4), (1 / 4, 0.75))):
+            sel = (r >= lo) & (r < hi)
+            out[f"b{k}"] = round(float(P[..., sel].sum() / ref[..., sel].sum().clamp(min=1e-12)), 4)
+        num_x = (em[..., :, 1:] * em[..., :, :-1] * m[..., :, 1:] * m[..., :, :-1]).sum((-2, -1))
+        den_x = ((em[..., :, 1:] ** 2 * m[..., :, :-1]).sum((-2, -1)) * (em[..., :, :-1] ** 2 * m[..., :, 1:]).sum((-2, -1))).sqrt()
+        num_y = (em[..., 1:, :] * em[..., :-1, :] * m[..., 1:, :] * m[..., :-1, :]).sum((-2, -1))
+        den_y = ((em[..., 1:, :] ** 2 * m[..., :-1, :]).sum((-2, -1)) * (em[..., :-1, :] ** 2 * m[..., 1:, :]).sum((-2, -1))).sqrt()
+        out["lag1"] = round(float(0.5 * ((num_x / den_x.clamp(min=1e-12)).mean() + (num_y / den_y.clamp(min=1e-12)).mean())), 4)
+        out["std"] = round(float(var.mean().sqrt()), 4)
+        return out
+
+    @torch.no_grad()
     def _scr_image_metrics(self, dec_hr, dec_lr, core_hr_mask_LR):
         """Once per image, on the raw stream decodes BEFORE the feather (spec §5).
         E_pix : RMSE(area_down(dec_hr), dec_lr) on core pixels eroded by 8 px (@1024), / std(dec_lr) there.
@@ -423,6 +455,21 @@ class FluxPipeline(FluxPipeline_BASE):
                    "t_ms": {k: round(v, 2) for k, v in ms.items()}}
             if delta is not None:
                 rec["relay"] = _rel(delta, hr_x0_before.float() * core_seq_hr)
+            if core_hr_mask_LR is not None:
+                # Phase Q / X3: whiteness of the HR stream's own noise estimate inside the core, BEFORE this
+                # step's relay write (so it reflects what earlier writes did to the HR state)
+                s_h = float(t_hr) / 1000.0
+                eps_h = (latents_hr.float() - (1.0 - s_h) * hr_x0_before.float()) / s_h
+                rec["eps"] = self._scr_eps_stats(eps_h, core_hr_mask_LR)
+                if next_t_hr is None and delta is not None:
+                    # last step: the final write is never denoised. Grid lock of Dec(x_H + g d) - Dec(x_H).
+                    from .scr_metrics import grid_lock, luma
+                    a = self._vae1_decode(hr_x0.to(dt), hw_scale=2).float()
+                    b = self._vae1_decode(hr_x0_before.to(dt), hw_scale=2).float()
+                    diff = luma((a - b)[0].permute(1, 2, 0).cpu().numpy() * 127.5)        # 0-255 units
+                    core_px = transform_base_mask(core_hr_mask_LR, 2, patch_size=16)[0, 0].cpu().numpy()
+                    log["last_write_grid_lock"] = {f"P{P}": grid_lock(diff, core_px, P, highpass=False)
+                                                   for P in (8, 16, 32)}
             log["steps"].append(rec)
         return lr_new, hr_new, lr_x0, hr_x0
 
@@ -1120,8 +1167,15 @@ class FluxPipeline(FluxPipeline_BASE):
                     self._trace_dump(j, latents_hr_x0_new, latents_lr_x0_new, actual_hr_mask,
                                      core_hr_mask_LR, feather_radius, hr_scale)
 
-                if (pad1 > 0) and (pad2 > 0) and next_t_hr is not None:
-                    lt_up_lr_x0, _ = self._resize_x0_to_x0(latents_lr_x0_new, hr_scale, "bi", ori_scale=1)
+                # E&R / native refresh. The two halves are gated separately (Phase Q / X4: --pad_lr 0 --pad_hr N
+                # = outer HR band only); with pad1 == pad2 > 0 (every earlier run) this is unchanged.
+                # --native_xscale taef1|vae (Phase Q / X2) swaps the learned resizers for pixel-space operators.
+                _nx = getattr(self, "native_xscale", None) if _nc in ("near", "full") else None
+                if (pad2 > 0) and next_t_hr is not None:
+                    if _nx:
+                        lt_up_lr_x0 = build_xscale(self, _nx).up(latents_lr_x0_new)
+                    else:
+                        lt_up_lr_x0, _ = self._resize_x0_to_x0(latents_lr_x0_new, hr_scale, "bi", ori_scale=1)
                     latents_hr = self._synthesize_latents_from_x0(
                         lt_up_lr_x0,
                         latents_hr_new,
@@ -1133,8 +1187,15 @@ class FluxPipeline(FluxPipeline_BASE):
                     latents_hr = latents_hr_new
                     latents_hr_x0 = latents_hr_x0_new
 
-                if (pad1 > 0) and (pad2 > 0) and next_t_lr is not None:
-                    lt_down_hr_x0, _ = self._resize_x0_to_x0(latents_hr_x0_new, 1.0 / hr_scale, "", ori_scale=hr_scale)
+                if (pad1 > 0) and next_t_lr is not None:
+                    if _nx:
+                        # clean composite: HR tokens the stream never processed are replaced by up(LR), so the
+                        # decoder's receptive field around the core sees content, not the unprocessed init
+                        hr_comp = (actual_hr_mask.float() * latents_hr_x0_new.float()
+                                   + (1.0 - actual_hr_mask.float()) * lt_up_lr_x0.float()).to(latents_hr_x0_new.dtype)
+                        lt_down_hr_x0 = build_xscale(self, _nx).down(hr_comp)
+                    else:
+                        lt_down_hr_x0, _ = self._resize_x0_to_x0(latents_hr_x0_new, 1.0 / hr_scale, "", ori_scale=hr_scale)
                     latents_lr = self._synthesize_latents_from_x0(
                         lt_down_hr_x0,
                         latents_lr_new,
@@ -1164,6 +1225,16 @@ class FluxPipeline(FluxPipeline_BASE):
         # fill: lr with hr | hr with lr
         lt_lr_fake, _ = self._resize_x0_to_x0(latents_hr, 1./hr_scale, "repeat", ori_scale=hr_scale, align_mean=False)
         latents_lr = latents_lr * actual_lr_mask + lt_lr_fake * (1. - actual_lr_mask)
+        if _nc in ("near", "full") and getattr(self, "native_final_core", "lr") == "hr":
+            # Phase Q / X2: single owner in the final render too. Inside the core the LR canvas becomes
+            # R_down(final HR) instead of the LR model's last estimate of the proxy, so the inner half of the
+            # feather blends HR with a view of HR, not with a second picture.
+            _fx = getattr(self, "native_xscale", None)
+            _xs = build_xscale(self, _fx) if _fx else build_xscale(self, "learned")
+            _up = _xs.up(latents_lr)
+            _comp = (actual_hr_mask.float() * latents_hr.float() + (1.0 - actual_hr_mask.float()) * _up.float()).to(latents_hr.dtype)
+            _core = rearrange(transform_base_mask(core_hr_mask_LR, 1, patch_size=1).float(), "b c h w -> b (h w) c")
+            latents_lr = (latents_lr.float() * (1.0 - _core) + _xs.down(_comp).float() * _core).to(latents_lr.dtype)
         if _nc == "relay" and getattr(self, "scr_final_fill", "repeat") == "xscale":
             # SCR §2.7: fill the HR latent outside the core with R_up(LR) instead of nearest-upsampled latents,
             # so inside the 28 px feather dec_hr is ~ a round trip of the LR image rather than off-manifold.
@@ -1176,12 +1247,11 @@ class FluxPipeline(FluxPipeline_BASE):
         dec_lr = self._vae1_decode(latents_lr, hw_scale=1, need_unpack=True)
         dec_lr_up = F.interpolate(dec_lr, scale_factor=hr_scale, mode="bicubic", align_corners=False).clamp_(-1.0, 1.0)
         dec_hr = self._vae1_decode(latents_hr, hw_scale=2, need_unpack=True) # (1, 3, 1024, 1024)
-        if _nc == "relay":
-            if self._scr_log is not None:                      # raw streams, before the feather (spec §5)
-                self._scr_log.update(self._scr_image_metrics(dec_hr, dec_lr, core_hr_mask_LR))
-            if getattr(self, "scr_dump_streams", False):
-                self._scr_streams = {"dec_hr": self.image_processor.postprocess(dec_hr, output_type="pil")[0],
-                                     "dec_lr": self.image_processor.postprocess(dec_lr, output_type="pil")[0]}
+        if _nc == "relay" and self._scr_log is not None:       # raw streams, before the feather (spec §5)
+            self._scr_log.update(self._scr_image_metrics(dec_hr, dec_lr, core_hr_mask_LR))
+        if getattr(self, "scr_dump_streams", False):           # any mode: raw HR / LR decodes, no feather
+            self._scr_streams = {"dec_hr": self.image_processor.postprocess(dec_hr, output_type="pil")[0],
+                                 "dec_lr": self.image_processor.postprocess(dec_lr, output_type="pil")[0]}
         core_hr_mask_pix = transform_base_mask(core_hr_mask_LR, hr_scale, patch_size=16) 
         core_hr_mask_pix_feather = feather_mask_from_bool(core_hr_mask_pix, radius=feather_radius)
         image = dec_lr_up.float() * (1. - core_hr_mask_pix_feather) + dec_hr.float() * core_hr_mask_pix_feather
